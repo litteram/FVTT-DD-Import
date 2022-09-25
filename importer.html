@@ -12,11 +12,6 @@
       {{/select}}
     </select>
   </div>
-  <div class="form-group import convert-section" title="You can save images as webp which will make them a lot smaller, but creation time is a bit longer">
-    <label class="import-options">Convert to WebP <i class="far fa-question-circle"></i></label>
-    <input type="checkbox" name="convert-to-webp" {{#if webpConversion}}checked{{/if}}>
-  </div>
-
   <div class="form-group import convert-section" title="You can set a custom Grid PPI value at time of import to change the resolution of the generated image">
     <label class="import-options">Set Custom Grid PPI <i class="far fa-question-circle"></i></label>
     <input type="checkbox" class="use-custom-gridPPI" name="use-custom-gridPPI" {{#if useCustomPixelsPerGrid}}checked{{/if}}>
@@ -61,11 +56,12 @@
   <div class="form-group import">
     <label class="import-options">Upload Universal VTT (.dd2vtt, .df2vtt, .uvtt)</label>
   </div>
-  <div class="form-group import" id="dd-upload-files" style="flex-direction: column";>
-    <button type="button" class="add-file">Add another file</button>
 
-    <input class="file-input" type='file' name='file0' accept=".dd2vtt,.df2vtt,.uvtt" />
-    <input class="hidden-input" type='hidden' value="1" name="filecount" />
+  <div class="form-group import" id="dd-upload-files" style="flex-direction: column";>
+    <label class="import-options" for="files">Select one or more files</label>
+    <input class="file-input" type='file' name='files' multiple accept=".dd2vtt,.df2vtt,.uvtt" />
+    <p><b>note:</b> Selected Files will be imported in alphabetical order</p>
+
     <div class="multi-mode-section" style="display: none">
       <label class="import-options">Add walls around single files</label>
       <input type="checkbox" name="walls-around-files" {{#if wallsAroundFiles}}checked{{/if}}>
@@ -78,9 +74,10 @@
         {{/each}}
         {{/select}}
       </select><br />
-      <label class="import-options">Image File Name (also Scenename if empty)</label><input type='text' name="imageFileName" />
+      <label class="import-options">Image File Name (also sets Scenename if empty)</label><input type='text' name="imageFileName" />
     </div>
   </div>
+
   <div>
     <hr />
     <h3>Advanced:</h3>

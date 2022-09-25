@@ -19,7 +19,7 @@ Hooks.on("init", () => {
       source: "data",
       bucket: "",
       region: "",
-      path: "worlds/" + game.world.id,
+      path: "worlds/" + game.world.id + "/stages",
       offset: 0.0,
       fidelity: 3,
       multiImageMode: "g",
@@ -90,7 +90,6 @@ class DDImporter extends FormApplication {
     return data
   }
 
-
   async _updateObject(event, formData) {
     try {
       let sceneName = formData["sceneName"]
@@ -101,68 +100,70 @@ class DDImporter extends FormApplication {
       let bucket = formData["bucket"]
       let region = formData["region"]
       let path = formData["path"]
-      let filecount = formData["filecount"]
       let mode = formData["multi-mode"]
-      let toWebp = formData["convert-to-webp"]
       let objectWalls = formData["object-walls"]
       let wallsAroundFiles = formData["walls-around-files"]
       let imageFileName = formData["imageFileName"]
       let useCustomPixelsPerGrid = formData["use-custom-gridPPI"]
       let customPixelsPerGrid = formData["customGridPPI"] * 1
-      var firstFileName
 
       if ((!bucket || !region) && source == "s3")
         return ui.notifications.error("Bucket and Region required for S3 upload")
 
       let files = []
-      var fileName = 'combined'
-      for (var i = 0; i < filecount; i++) {
-        let fe = this.element.find("[name=file" + i + "]")
-        if (fe[0].files[0] === undefined) {
-          console.log("SKIPPING")
-          continue
-        }
-        try {
-          files.push(JSON.parse(await fe[0].files[0].text()));
-          fileName = fileName + '-' + fe[0].files[0].name.split(".")[0];
-          // save the first filename
-          if (files.length == 1) {
-            firstFileName = fe[0].files[0].name.split(".")[0]
-          }
-        } catch (e) {
-          if (filecount > 1) {
-            ui.notifications.warning("Skipping due to error while importing: " + fe[0].files[0].name + " " + e)
-          } else {
-            throw (e)
-          }
-        }
+      for (const file of this.element.find("[name=files]")[0].files) {
+        files.push(file)
       }
+
+      // sort by filename
+      files.sort((prev, next) => {
+        const a = prev.name.toUpperCase()
+        const b = next.name.toUpperCase()
+        if (a < b)
+          return -1
+        if (a > b)
+          return 1
+        return 0
+      })
+
+      // File names
+      let fileName = DDImporter.fileBasename(files[0].name);
+      if (files.length > 1) {
+        ui.notifications.notify("Combining images may take quite some time, be patient")
+        fileName = "combined-" + Array.prototype.map.call(files, (f) => f.name).join("-")
+      }
+
+      // Redundant, set by the UI automatically
+      if (!imageFileName.length) {
+        fileName = imageFileName
+      }
+
+      // lets use the first filename for the scene
+      if (sceneName.length == 0) {
+        sceneName = fileName
+      }
+
+      // read and parse files as JSON, parse images as Blob
+      files = await Promise
+        .all(files.map((file) => file.text()))
+        .then(data => data.map(JSON.parse))
+        .then(data => data.map(item => {
+          item.image = DDImporter.b64ToBlob(item.image)
+          return item
+        }))
+        .catch(e => console.error("Error parsing files.", e))
+
       // keep the original filename if it is only one file at all
       if (files.length == 0) {
-        ui.notifications.error("Skipped all files while importing.")
+        ui.notifications.error("Skipped all files while importing or no file has been selected.")
         throw new Error("Skipped all files");
-      }
-      if (files.length == 1) {
-        fileName = firstFileName;
-      } else {
-        ui.notifications.notify("Combining images may take quite some time, be patient")
-      }
-      if (imageFileName) {
-        fileName = imageFileName
-        firstFileName = imageFileName
-      }
-      // lets use the first filename for the scene
-      if (sceneName == '') {
-        sceneName = firstFileName
       }
 
       // determine the pixels per grid value to use
-      let pixelsPerGrid = ""
-      if (useCustomPixelsPerGrid) {
-        pixelsPerGrid = customPixelsPerGrid
-      } else {
-        pixelsPerGrid = files[0].resolution.pixels_per_grid
-      }
+      let pixelsPerGrid = useCustomPixelsPerGrid
+          ? customPixelsPerGrid
+          : files[0].resolution.pixels_per_grid
+
       console.log("Grid PPI = ", pixelsPerGrid)
 
       // do the placement math
@@ -204,8 +205,10 @@ class DDImporter extends FormApplication {
           var next_v_index = index + hwidth
           // fill up each row, until all images are placed
           while (index < Math.min(next_v_index, files.length)) {
-            files[index].pos_in_image = { "y": vcount * size.y, "x": (index - vcount * hwidth) * size.x }
-            files[index].pos_in_grid = { "y": vcount * grid_size.y, "x": (index - vcount * hwidth) * grid_size.x }
+            files[index].pos_in_image = { y: vcount * size.y,
+                                          x: (index - vcount * hwidth) * size.x }
+            files[index].pos_in_grid = { y: vcount * grid_size.y,
+                                         x: (index - vcount * hwidth) * grid_size.x }
             index += 1
           }
           hcount -= hwidth
@@ -217,55 +220,49 @@ class DDImporter extends FormApplication {
       width = gridw * pixelsPerGrid
       height = gridh * pixelsPerGrid
       //placement math done.
-      //Now use the image direct, in case of only one image and no conversion required
-      var image_type = '?'
 
       // This code works for both single files and multiple files and supports resizing during scene generation
       // Use a canvas to place the image in case we need to convert something
       let thecanvas = document.createElement('canvas');
       thecanvas.width = width;
       thecanvas.height = height;
-      let mycanvas = thecanvas.getContext("2d");
-      ui.notifications.notify("Processing Images")
-      for (var fidx = 0; fidx < files.length; fidx++) {
-        ui.notifications.notify("Processing " + (fidx + 1) + " out of " + files.length + "images")
-        let f = files[fidx];
-        image_type = DDImporter.getImageType(atob(f.image.substr(0, 8)));
-        await DDImporter.image2Canvas(mycanvas, f, image_type, size.x, size.y)
-      }
-      ui.notifications.notify("Uploading image ....")
-      if (toWebp) {
-        image_type = 'webp';
+
+      let ctx = thecanvas.getContext("2d");
+      ui.notifications.notify("Processing " + files.lenght + " Images")
+
+      for (const [idx, file] of files.entries()) {
+        ui.notifications.notify("Processing " + (idx + 1) + " of " + files.length + " images")
+
+        const img = await DDImporter.loadImageBlob(file.image)
+        const imageWidth = pixelsPerGrid * file.resolution.map_size.x
+        const imageHeight = pixelsPerGrid * file.resolution.map_size.y
+
+        await ctx.drawImage(img, file.pos_in_image.x, file.pos_in_image.y, imageWidth, imageHeight)
       }
 
-      var p = new Promise(function (resolve) {
-        thecanvas.toBlob(function (blob) {
-          blob.arrayBuffer().then(bfr => {
-            DDImporter.uploadFile(bfr, fileName, path, source, image_type, bucket)
-              .then(function () {
-                resolve()
-              })
-          })
-        }, "image/" + image_type);
-      })
+      ui.notifications.notify("Uploading image: " + fileName)
+
+      let buf = await DDImporter.canvas2buffer(thecanvas, "image/webp")
+      let uploading = DDImporter.uploadFile(buf, fileName, path, source, "webp", bucket)
 
       // aggregate the walls and place them right
       let aggregated = {
-        "format": 0.2,
-        "resolution": {
-          "map_origin": { "x": files[0].resolution.map_origin.x, "y": files[0].resolution.map_origin.y },
-          "map_size": { "x": gridw, "y": gridh },
-          "pixels_per_grid": pixelsPerGrid,
+        format: 0.2,
+        resolution: {
+          map_origin: { x: files[0].resolution.map_origin.x,
+                        y: files[0].resolution.map_origin.y },
+          map_size: { x: gridw,
+                      y: gridh },
+          pixels_per_grid: pixelsPerGrid,
         },
-        "line_of_sight": [],
-        "portals": [],
-        "environment": files[0]["environment"],
-        "lights": [],
+        line_of_sight: [],
+        portals: [],
+        environment: files[0].environment,
+        lights: [],
       }
 
       // adapt the walls
-      for (var fidx = 0; fidx < files.length; fidx++) {
-        let f = files[fidx];
+      for (const f of files) {
         if (objectWalls)
           f.line_of_sight = f.line_of_sight.concat(f.objects_line_of_sight || [])
         f.line_of_sight.forEach(function (los) {
@@ -292,20 +289,27 @@ class DDImporter extends FormApplication {
         if (wallsAroundFiles && files.length > 1) {
           aggregated.line_of_sight.push(
             [
-              { 'x': f.pos_in_grid.x, 'y': f.pos_in_grid.y },
-              { 'x': f.pos_in_grid.x + f.resolution.map_size.x, 'y': f.pos_in_grid.y },
-              { 'x': f.pos_in_grid.x + f.resolution.map_size.x, 'y': f.pos_in_grid.y + f.resolution.map_size.y },
-              { 'x': f.pos_in_grid.x, 'y': f.pos_in_grid.y + f.resolution.map_size.y },
-              { 'x': f.pos_in_grid.x, 'y': f.pos_in_grid.y }
+              { x: f.pos_in_grid.x,
+                y: f.pos_in_grid.y },
+              { x: f.pos_in_grid.x + f.resolution.map_size.x,
+                y: f.pos_in_grid.y },
+              { x: f.pos_in_grid.x + f.resolution.map_size.x,
+                y: f.pos_in_grid.y + f.resolution.map_size.y },
+              { x: f.pos_in_grid.x,
+                y: f.pos_in_grid.y + f.resolution.map_size.y },
+              { x: f.pos_in_grid.x,
+                y: f.pos_in_grid.y }
             ])
         }
         aggregated.lights = aggregated.lights.concat(f.lights)
         aggregated.portals = aggregated.portals.concat(f.portals)
       }
-      ui.notifications.notify("upload still in progress, please wait")
-      await p
+
+      ui.notifications.notify("Prepared files uploading ...")
+      await uploading
+
       ui.notifications.notify("creating scene")
-      DDImporter.DDImport(aggregated, sceneName, fileName, path, fidelity, offset, padding, image_type, bucket, region, source, pixelsPerGrid)
+      DDImporter.DDImport(aggregated, sceneName, fileName, path, fidelity, offset, padding, "webp", bucket, region, source, pixelsPerGrid)
 
       game.settings.set("dd-import", "importSettings", {
         source: source,
@@ -316,15 +320,14 @@ class DDImporter extends FormApplication {
         padding: padding,
         fidelity: fidelity,
         multiImageMode: mode,
-        webpConversion: toWebp,
+        webpConversion: true,
         wallsAroundFiles: wallsAroundFiles,
       });
-    }
-    catch (e) {
+    } catch (e) {
+      console.error(e)
       ui.notifications.error("Error Importing: " + e)
     }
   }
-
 
   activateListeners(html) {
     super.activateListeners(html)
@@ -335,36 +338,33 @@ class DDImporter extends FormApplication {
     this.setRangeValue(html)
 
 
-    html.find(".path-input").keyup(ev => DDImporter.checkPath(html))
-    html.find(".fidelity-input").change(ev => DDImporter.checkFidelity(html))
-    html.find(".source-selector").change(ev => DDImporter.checkSource(html))
-    html.find(".padding-input").change(ev => this.setRangeValue(html))
+    html.find(".path-input")
+        .keyup(ev => DDImporter.checkPath(html))
+    html.find(".fidelity-input")
+        .change(ev => DDImporter.checkFidelity(html))
+    html.find(".source-selector")
+        .change(ev => DDImporter.checkSource(html))
+    html.find(".padding-input")
+        .change(ev => this.setRangeValue(html))
 
-    html.find(".add-file").click(async ev => {
-      var newfile = document.createElement("input");
-      let counter = html.find('[name="filecount"]')[0]
-      newfile.setAttribute("class", "file-input")
-      newfile.setAttribute("type", "file")
-      newfile.setAttribute("accept", ".dd2vtt,.df2vtt,.uvtt")
-      newfile.setAttribute("name", "file" + counter.value)
-      counter.value = parseInt(counter.value) + 1
-      let files = html.find("#dd-upload-files")[0]
-      files.insertBefore(newfile, counter)
-      html.find(".multi-mode-section")[0].style.display = ""
-    })
+    html.find(".file-input").change(ev => {
+      let el = ev.currentTarget
 
-    html.find(".use-custom-gridPPI").click(async ev => {
-      if (html.find('[name="use-custom-gridPPI"]')[0].checked) {
-        html.find(".custom-gridPPI-section")[0].style.display = ""
-      } else {
-        html.find(".custom-gridPPI-section")[0].style.display = "none"
+      html.find(".multi-mode-section")[0]
+          .style.display = el.files.length > 1 ? "" : "none"
+
+      if (el.files.length) {
+        html.find("input[name=imageFileName]")
+            .val(DDImporter.fileBasename(el.files[0].name))
       }
     })
 
-    html.find(".import-map").click(async ev => {
-
-
+    html.find(".use-custom-gridPPI").change(ev => {
+      html.find(".custom-gridPPI-section")[0]
+          .style.display = ev.currentTarget.checked ? "" : "none"
     })
+
+    html.find(".import-map").click(ev => {})
   }
 
   setRangeValue(html) {
@@ -402,37 +402,53 @@ class DDImporter extends FormApplication {
 
   }
 
-
-  static DecodeImage(file) {
-    var byteString = atob(file.image);
-    var ab = new ArrayBuffer(byteString.length);
-    var ia = new Uint8Array(ab);
-
-    for (var i = 0; i < byteString.length; i++) {
-      ia[i] = byteString.charCodeAt(i);
+  /* https://developer.mozilla.org/en-US/docs/Glossary/Base64#solution_2_%E2%80%93_rewriting_atob_and_btoa_using_typedarrays_and_utf-8 */
+  static base64DecToArr(sBase64, nBlocksSize) {
+    function b64ToUint6(nChr) {
+      return nChr > 64 && nChr < 91
+        ? nChr - 65
+        : nChr > 96 && nChr < 123
+        ? nChr - 71
+        : nChr > 47 && nChr < 58
+        ? nChr + 4
+        : nChr === 43
+        ? 62
+        : nChr === 47
+        ? 63
+        : 0;
     }
-    return ab;
-  }
 
-  static Uint8ToBase64(u8Arr) {
-    var CHUNK_SIZE = 0x8000;
-    var index = 0;
-    var length = u8Arr.length;
-    var result = '';
-    var slice;
-    // we need to do slices for large amount of data
-    while (index < length) {
-      slice = u8Arr.subarray(index, Math.min(index + CHUNK_SIZE, length));
-      result += String.fromCharCode.apply(null, slice);
-      index += CHUNK_SIZE;
+    const sB64Enc = sBase64.replace(/[^A-Za-z0-9+/]/g, "");
+    const nInLen = sB64Enc.length;
+    const nOutLen = nBlocksSize
+          ? Math.ceil(((nInLen * 3 + 1) >> 2) / nBlocksSize) * nBlocksSize
+          : (nInLen * 3 + 1) >> 2;
+    const taBytes = new Uint8Array(nOutLen);
+
+    let nMod3;
+    let nMod4;
+    let nUint24 = 0;
+    let nOutIdx = 0;
+    for (let nInIdx = 0; nInIdx < nInLen; nInIdx++) {
+      nMod4 = nInIdx & 3;
+      nUint24 |= b64ToUint6(sB64Enc.charCodeAt(nInIdx)) << (6 * (3 - nMod4));
+      if (nMod4 === 3 || nInLen - nInIdx === 1) {
+        nMod3 = 0;
+        while (nMod3 < 3 && nOutIdx < nOutLen) {
+          taBytes[nOutIdx] = (nUint24 >>> ((16 >>> nMod3) & 24)) & 255;
+          nMod3++;
+          nOutIdx++;
+        }
+        nUint24 = 0;
+      }
     }
-    return btoa(result);
+
+    return taBytes;
   }
 
   static getImageType(bytes) {
     let magic = bytes.substr(0, 4);
     console.log(magic);
-    console.log(magic.charCodeAt(0));
     if (magic == "\u0089PNG") {
       return 'png'
     } else if (magic == "RIFF") {
@@ -443,28 +459,66 @@ class DDImporter extends FormApplication {
     return 'png';
   }
 
-  static image2Canvas(canvas, file, extension, imageWidth, imageHeight) {
-    return new Promise(function (resolve) {
-      var image = new Image();
-      image.decoding = 'sync';
-      image.addEventListener('load', function () {
-        image.decode().then(() => {
-          canvas.drawImage(image, file.pos_in_image.x, file.pos_in_image.y, imageWidth, imageHeight);
-          resolve()
-        }).catch(e => {
-          console.log("decode failed because of DOMException, lets try directly");
-          console.log(e);
-          canvas.drawImage(image, file.pos_in_image.x, file.pos_in_image.y, imageWidth, imageHeight);
-          resolve()
-        });
-      });
-      image.src = "data:image/" + extension + ";base64," + file.image
-    });
+  /**
+   * returns a promise of the canvas blob as an ArrayBuffer
+   */
+  static canvas2buffer(canvas, type) {
+    return new Promise((resolve) => {
+      canvas.toBlob(resolve, type)
+    })
+      .then(blob => blob.arrayBuffer())
   }
 
-  static async uploadFile(file, name, path, source, extension, bucket) {
-    let uploadFile = new File([file], name + "." + extension, { type: 'image/' + extension });
-    await FilePicker.upload(source, path, uploadFile, { bucket: bucket })
+  static b64ToBlob(data) {
+    const rawdata = DDImporter.base64DecToArr(data)
+    const header = Array.prototype.map.call(rawdata.subarray(0,4), (ch) => String.fromCharCode(ch)).join('');
+    const imageType = DDImporter.getImageType(header)
+
+    return new Blob([rawdata], {
+      type: "image/" + imageType,
+    })
+  }
+
+  static loadImageBlob(blob) {
+    return new Promise((resolve, reject) => {
+      const image = new Image()
+
+      image.addEventListener('load', () =>{
+        URL.revokeObjectURL(blob)
+        resolve(image)
+      })
+
+      image.addEventListener('error', (e) => {
+        URL.revokeObjectURL(blob)
+        reject(e)
+      })
+
+      image.src = URL.createObjectURL(blob)
+    })
+  }
+
+  /**
+   * Writes a b64 image
+   */
+  static async image2Canvas(ctx, file, image_type, imageWidth, imageHeight) {
+    image_type = DDImporter.getImageType(atob(file.image.substr(0, 8)));
+
+    const img = new Image()
+    img.decoding = "sync"
+    img.src = "data:image/" + image_type + ";base64," + file.image
+    await img.decode()
+    return ctx.drawImage(img, file.pos_in_image.x, file.pos_in_image.y, imageWidth, imageHeight)
+  }
+
+  static uploadFile(buffer, name, path, source, image_type, bucket) {
+    const f = new File(
+      [buffer],
+      name + "." + image_type,
+      { type: 'image/' + image_type },
+    )
+
+    return FilePicker
+      .upload(source, path, f, { bucket: bucket })
   }
 
   static async DDImport(file, sceneName, fileName, path, fidelity, offset, padding, extension, bucket, region, source, pixelsPerGrid) {
@@ -476,6 +530,7 @@ class DDImporter extends FormApplication {
         imagePath = "/" + imagePath
       imagePath = "https://" + bucket + ".s3." + region + ".amazonaws.com" + imagePath;
     }
+
     let newScene = new Scene({
       name: sceneName,
       grid: pixelsPerGrid,
@@ -486,16 +541,17 @@ class DDImporter extends FormApplication {
       shiftX: 0,
       shiftY: 0
     })
-    newScene.updateSource(
-      {
-        walls: this.GetWalls(file, newScene, 6 - fidelity, offset, pixelsPerGrid).concat(this.GetDoors(file, newScene, offset, pixelsPerGrid)).map(i => i.toObject()),
-        lights: this.GetLights(file, newScene, pixelsPerGrid).map(i => i.toObject())
-      })
-    //mergeObject(newScene.data, {walls: walls.concat(doors), lights: lights})
-    let scene = await Scene.create(newScene.toObject());
-    scene.createThumbnail().then(thumb => {
-      scene.update({ "thumb": thumb.thumb });
+
+    newScene.updateSource({
+      walls: this.GetWalls(file, newScene, 6 - fidelity, offset, pixelsPerGrid).concat(this.GetDoors(file, newScene, offset, pixelsPerGrid)).map(i => i.toObject()),
+      lights: this.GetLights(file, newScene, pixelsPerGrid).map(i => i.toObject())
     })
+
+    //mergeObject(newScene.data, {walls: walls.concat(doors), lights: lights})
+    //
+    let scene = await Scene.create(newScene.toObject());
+    let thumb = await scene.createThumbnail()
+    return scene.update({ thumb: thumb.thumb })
   }
 
   static GetWalls(file, scene, skipNum, offset, pixelsPerGrid) {
@@ -736,13 +792,13 @@ class DDImporter extends FormApplication {
             x: ((light.position.x - file.resolution.map_origin.x) * pixelsPerGrid) + offsetX,
             y: ((light.position.y - file.resolution.map_origin.y) * pixelsPerGrid) + offsetY,
             rotation: 0,
-          dim: light.range * 4,
-          bright: light.range * 2,
-          angle: 360,
-          tintColor: "#" + light.color.substring(2),
-          tintAlpha: (0.05 * light.intensity)
-        })
-        lights.push(newLight);
+            dim: light.range * 4,
+            bright: light.range * 2,
+            angle: 360,
+            tintColor: "#" + light.color.substring(2),
+            tintAlpha: (0.05 * light.intensity)
+          })
+          lights.push(newLight);
         }
         catch(e)
         {
@@ -755,10 +811,10 @@ class DDImporter extends FormApplication {
 
   /**
    * Checks if point is within map crop
-   * 
+   *
    * @param {Object} file uvtt file
    * @param {Object} position {x, y}
-   * @returns 
+   * @returns
    */
   static isWithinMap(file, position) {
 
@@ -773,13 +829,16 @@ class DDImporter extends FormApplication {
 
     if (
       position.x >= map_originX &&
-      position.x <= map_originX + map_sizeX &&
-      position.y >= map_originY &&
-      position.y <= map_originY + map_sizeY)
+        position.x <= map_originX + map_sizeX &&
+        position.y >= map_originY &&
+        position.y <= map_originY + map_sizeY)
       within = true
     else within = false
 
     return within
+  }
 
+  static fileBasename(filename) {
+    return filename.split(".")[0]
   }
 }
